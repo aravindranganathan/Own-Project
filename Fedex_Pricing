@@ -1,0 +1,97 @@
+import requests
+import json
+
+# Configuration
+BASE_URL = "https://fedex.com" # Use https://fedex.com for production
+CLIENT_ID = "YOUR_CLIENT_ID"
+CLIENT_SECRET = "YOUR_CLIENT_SECRET"
+ACCOUNT_NUMBER = "YOUR_ACCOUNT_NUMBER"
+
+def get_fedex_token():
+    """Authenticates with FedEx and returns an access token."""
+    url = f"{BASE_URL}/oauth/token"
+    payload = {
+        'grant_type': 'client_credentials',
+        'client_id': CLIENT_ID,
+        'client_secret': CLIENT_SECRET
+    }
+    headers = {'content-type': "application/x-www-form-urlencoded"}
+    response = requests.post(url, data=payload, headers=headers)
+    return response.json()['access_token']
+
+def fetch_rates(token):
+    """Fetches shipping rates for a specific package profile."""
+    url = f"{BASE_URL}/rate/v1/rates/quotes"
+    headers = {
+        'Content-Type': "application/json",
+        'Authorization': f"Bearer {token}"
+    }
+    
+    # Example payload for a 10lb package from New York to Los Angeles
+    payload = {
+        "accountNumber": {"value": ACCOUNT_NUMBER},
+        "requestedShipment": {
+            "shipper": {"address": {"postalCode": "10001", "countryCode": "US"}},
+            "recipient": {"address": {"postalCode": "90001", "countryCode": "US"}},
+            "shipTimestamp": "2026-10-01T10:00:00",
+            "pickupType": "DROPOFF_AT_FEDEX_LOCATION",
+            "requestedPackageLineItems": [
+                {
+                    "weight": {"units": "LB", "value": 10}
+                }
+            ]
+        }
+    }
+    
+    response = requests.post(url, json=payload, headers=headers)
+    return response.json()
+
+# Execute and save data
+token = get_fedex_token()
+pricing_info = fetch_rates(token)
+
+# Save as JSON to use for your RAG documents
+with open("fedex_rates.json", "w") as f:
+    json.dump(pricing_info, f, indent=4)
+
+def transform_json_to_text(rate_json):
+    """Converts the FedEx JSON response into readable paragraphs for an LLM."""
+    documents = []
+    shipment_details = rate_json.get("output", {}).get("rateReplyDetails", [])
+    
+    for detail in shipment_details:
+        service_type = detail.get("serviceType")
+        commit_details = detail.get("commit", {}).get("labelDelay", "N/A")
+        
+        for total_price in detail.get("ratedShipmentDetails", []):
+            net_price = total_price.get("totalNetPrice", 0)
+            currency = total_price.get("currency", "USD")
+            
+            text_doc = f"FedEx Service: {service_type}. Total Net Price: {net_price} {currency}. Delivery notes: {commit_details}."
+            documents.append(text_doc)
+            
+    return documents
+
+# Example of structured text ready for chunking
+text_documents = transform_json_to_text(pricing_info)
+print(text_documents[0]) 
+# Output: "FedEx Service: FEDEX_GROUND. Total Net Charge: 24.50 USD. Delivery notes: N/A."
+
+from langchain_core.documents import Document
+from langchain_chroma import Chroma
+from langchain_openai import OpenAIEmbeddings
+
+# 1. Convert text snippets to LangChain Document objects
+langchain_docs = [Document(page_content=text) for text in text_documents]
+
+# 2. Embed and store in a vector database
+vector_store = Chroma.from_documents(
+    documents=langchain_docs, 
+    embedding=OpenAIEmbeddings()
+)
+
+# 3. Query your RAG system
+retriever = vector_store.as_retriever()
+relevant_prices = retriever.invoke("How much does it cost to ship ground?")
+print(relevant_prices[0].page_content)
+
